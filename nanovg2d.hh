@@ -6,8 +6,13 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <map>
+#include <memory>
 
 namespace nanovg2d {
+
+// Forward declarations
+class Font;
 
 struct Vec2 {
     float x, y;
@@ -20,7 +25,35 @@ struct Vec2 {
     float length() const { return std::sqrt(x*x + y*y); }
     Vec2 normalize() const { float len = length(); if (len > 1e-6f) return Vec2(x / len, y / len); return *this; }
     float dot(const Vec2& other) const { return x * other.x + y * other.y; }
+    
+    // Additional vector operations needed for Bezier offsetting
+    Vec2 perpendicular() const { return Vec2(-y, x); }
+    float cross(const Vec2& other) const { return x * other.y - y * other.x; }
+    Vec2 operator-() const { return Vec2(-x, -y); }
 };
+
+// Bezier curve evaluation and offsetting utilities
+namespace bezier {
+    // Curve evaluation (de Casteljau)
+    Vec2 evalQuadratic(const Vec2& p0, const Vec2& p1, const Vec2& p2, float t);
+    Vec2 evalCubic(const Vec2& p0, const Vec2& p1, const Vec2& p2, const Vec2& p3, float t);
+    
+    // Derivatives
+    Vec2 quadraticDerivative(const Vec2& p0, const Vec2& p1, const Vec2& p2, float t);
+    Vec2 cubicDerivative(const Vec2& p0, const Vec2& p1, const Vec2& p2, const Vec2& p3, float t);
+    
+    // Curve splitting
+    void splitQuadratic(const Vec2& p0, const Vec2& p1, const Vec2& p2, 
+                        Vec2* left, Vec2* right, float t);
+    void splitCubic(const Vec2& p0, const Vec2& p1, const Vec2& p2, const Vec2& p3,
+                    Vec2* left, Vec2* right, float t);
+    
+    // Offsetting
+    void offsetQuadratic(const Vec2& p0, const Vec2& p1, const Vec2& p2, 
+                         Vec2* result, float distance, int quality = 2);
+    void offsetCubic(const Vec2& p0, const Vec2& p1, const Vec2& p2, const Vec2& p3, 
+                     Vec2* result, float distance, int quality = 3);
+}
 
 struct Color {
     uint8_t r, g, b, a;
@@ -66,9 +99,72 @@ struct Path {
     void quadraticTo(float cx, float cy, float x, float y) { commands.emplace_back(CommandType::QuadraticTo, Vec2(cx, cy), Vec2(x, y)); }
     void cubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y) { commands.emplace_back(CommandType::CubicTo, Vec2(c1x, c1y), Vec2(c2x, c2y), Vec2(x, y)); }
     void reset() { commands.clear(); closed = false; }
+    
+    // Add offset path capabilities
+    Path offsetPath(float distance, int quality = 3) const;
+};
+
+// New struct to hold glyph information
+struct Glyph {
+    Path path;                   // Vector path of the glyph
+    float advanceX;              // Horizontal advance width
+    float advanceY;              // Vertical advance (usually 0 for horizontal layouts)
+    float bearingX;              // Left bearing
+    float bearingY;              // Top bearing
+    int width;                   // Width of the glyph bitmap
+    int height;                  // Height of the glyph bitmap
+    std::vector<uint8_t> bitmap; // Optional glyph bitmap for direct rendering
+    // Add glyph index for TrueType
+    int glyphIndex = 0;
 };
 
 enum class AntialiasingLevel { None, Fast, Best };
+
+// Font class for managing TrueType fonts
+struct TrueTypeFontInfo {
+    const unsigned char* data = nullptr;
+    int fontOffset = 0;
+    int cmap = 0, glyf = 0, loca = 0, head = 0, hhea = 0, hmtx = 0, maxp = 0, kern = 0;
+    int numGlyphs = 0;
+    int indexLocFormat = 0;
+    int unitsPerEm = 0;
+    int ascent = 0, descent = 0, lineGap = 0;
+    int numHMetrics = 0;
+    int locaTableSize = 0;
+};
+
+#if 0
+// Helper functions for TrueType parsing
+uint16_t ttUSHORT(const unsigned char* p);
+int16_t ttSHORT(const unsigned char* p);
+uint32_t ttULONG(const unsigned char* p);
+int32_t ttLONG(const unsigned char* p);
+#endif
+
+class Font {
+public:
+    Font();
+    ~Font();
+    bool loadFromFile(const std::string& filename, float fontSize);
+    const Glyph* getGlyph(uint32_t codepoint);
+    float getKerning(uint32_t first, uint32_t second) const;
+    float getLineHeight() const;
+    float getAscender() const;
+    float getDescender() const;
+    // New helpers for TrueType
+    int getGlyphIndex(uint32_t codepoint) const;
+    bool getGlyphMetrics(int glyphIndex, int* advance, int* lsb) const;
+    bool getGlyphBox(int glyphIndex, int* x0, int* y0, int* x1, int* y1) const;
+    bool getGlyphOutline(int glyphIndex, std::vector<Vec2>& contour, std::vector<uint8_t>& onCurve) const;
+private:
+    TrueTypeFontInfo info;
+    float fontSize = 0.0f;
+    std::map<uint32_t, Glyph> glyphCache;
+    std::vector<unsigned char> fontBuffer; // Holds font file data
+    bool loadGlyph(uint32_t codepoint);
+    int findGlyphIndex(uint32_t codepoint) const;
+    // ... add more as needed ...
+};
 
 class Canvas {
 public:
@@ -81,6 +177,11 @@ public:
     void strokePath(const Path& path, const Color& color, float width);
     void drawRect(float x, float y, float w, float h, const Color& color, float strokeWidth = 1.0f);
     void fillRect(float x, float y, float w, float h, const Color& color);
+    
+    // New text rendering methods
+    void drawText(const std::string& text, float x, float y, Font* font, const Color& color);
+    float measureText(const std::string& text, Font* font);
+    
     uint8_t* getData();
     const uint8_t* getData() const;
     int getWidth() const { return width; }
@@ -104,12 +205,23 @@ private:
     float edgeDistance(const Vec2& p0, const Vec2& p1, const Vec2& point) const;
     void rasterizeLine(const Vec2& p0, const Vec2& p1, const Color& color, float width);
     void rasterizeLineAA(const Vec2& p0, const Vec2& p1, const Color& color, float width);
+    
+    // New helper methods for text rendering
+    void drawGlyphBitmap(const Glyph& glyph, float x, float y, const Color& color);
 };
 
 bool init();
 void shutdown();
+
+// Font management
+Font* createFont();
+void destroyFont(Font* font);
+
+// Path management
 Path* createPath();
 void destroyPath(Path* path);
+
+// File I/O
 bool writeBMP(const std::string& filename, int width, int height, const uint8_t* data);
 
 } // namespace nanovg2d
